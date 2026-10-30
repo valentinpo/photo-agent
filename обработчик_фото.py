@@ -204,7 +204,25 @@ def describe_image(path: Path) -> dict:
 
 # ---------------- Главная логика ----------------
 
-def process_folder(folder: str, dry_run: bool = False) -> None:
+def _load_existing(index_path: str) -> dict[str, dict]:
+    """Читает существующий индекс и возвращает словарь {path: entry}."""
+    out = {}
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        e = json.loads(line)
+                        if "path" in e:
+                            out[e["path"]] = e
+                    except json.JSONDecodeError:
+                        pass
+    return out
+
+
+def process_folder(folder: str, dry_run: bool = False, skip_existing: bool = False,
+                   new_index: bool = False) -> None:
     photos = scan_folder(folder)
     if not photos:
         print("Нет фотографий в папке.")
@@ -212,20 +230,30 @@ def process_folder(folder: str, dry_run: bool = False) -> None:
     print(f"Найдено фото: {len(photos)}\n")
     index_path = str(Path(folder) / INDEX_JSONL)
     csv_path = str(Path(folder) / INDEX_CSV)
-    succeeded = failed = renamed = 0
+
+    # Читаем прежний индекс (для skip_existing и дедупликации новых проходов)
+    existing = {} if new_index else _load_existing(index_path)
+
+    succeeded = failed = renamed = skipped = 0
 
     for i, orig in enumerate(photos, 1):
         print(f"[{i}/{len(photos)}] {orig.name}")
+        # Если файл уже описан и не просили заново — пропускаем
+        if skip_existing and str(orig) in existing:
+            print(f"   = пропущен (уже в индексе)")
+            skipped += 1
+            continue
         try:
             info = describe_image(orig)
         except Exception as e:  # noqa: BLE001
             print(f"   [error] {e}")
             failed += 1
-            _append_jsonl({
-                "filename": orig.name, "path": str(orig), "title": "",
-                "description": f"[не удалось описать: {e}]",
-                "keywords": [], "notes": "describe_failed",
-            }, index_path)
+            if not dry_run:
+                existing[str(orig)] = {
+                    "filename": orig.name, "path": str(orig), "title": "",
+                    "description": f"[не удалось описать: {e}]",
+                    "keywords": [], "notes": "describe_failed",
+                }
             continue
 
         target = orig
@@ -250,31 +278,42 @@ def process_folder(folder: str, dry_run: bool = False) -> None:
 
         if not dry_run:
             write_exif_description(target, info["description"], info["title"])
-            _append_jsonl({
+            # Кладём/обновляем запись по ключу path (дедупликация)
+            existing[str(target)] = {
                 "filename": target.name,
                 "path": str(target),
                 "title": info["title"],
                 "description": info["description"],
                 "keywords": info["keywords"],
                 "notes": "",
-            }, index_path)
+            }
         succeeded += 1
         print(f"   ✓ {info['title']}")
 
     if not dry_run:
+        # Пересобираем JSONL и CSV начисто из дедуплицированного словаря
+        with open(index_path, "w", encoding="utf-8") as f:
+            for e in existing.values():
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
         _rebuild_csv(index_path, csv_path)
-    print(f"\nГотово: обработано {succeeded}, ошибок {failed}, переименовано {renamed}.")
+    print(f"\nГотово: обработано {succeeded}, пропущено {skipped}, "
+          f"ошибок {failed}, переименовано {renamed}.")
     if not dry_run:
         print(f"Индекс: {index_path}")
         print(f"CSV:    {csv_path}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Обработка фотографий через GigaChat vision")
+    ap = argparse.ArgumentParser(description="Обработка фотографий через Yandex vision")
     ap.add_argument("folder", nargs="?", default=".", help="папка с фото")
     ap.add_argument("--dry-run", action="store_true", help="не менять файлы, только показать")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="не переописывать фото, уже присутствующие в индексе")
+    ap.add_argument("--new-index", action="store_true",
+                    help="начать индекс заново (игнорировать прежний)")
     args = ap.parse_args()
-    process_folder(args.folder, dry_run=args.dry_run)
+    process_folder(args.folder, dry_run=args.dry_run,
+                   skip_existing=args.skip_existing, new_index=args.new_index)
 
 
 if __name__ == "__main__":
